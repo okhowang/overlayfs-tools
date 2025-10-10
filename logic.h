@@ -28,6 +28,11 @@ int diff(const char* lowerdir, const char* upperdir);
 int merge(const char* lowerdir, const char* upperdir, FILE* script_stream);
 
 /*
+ * feature function. will take very long time to complete. returns 0 on success
+ */
+int mergeDirect(const char* lowerdir, const char* upperdir);
+
+/*
  * Unfold metacopy and redirect upper.
  *
  * mountdir is required and lowerdir is irrelevant.

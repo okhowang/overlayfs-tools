@@ -29,6 +29,7 @@ bool verbose;
 bool brief;
 bool ignore;
 bool force;
+bool non_shell;
 extern const char *program_name;
 
 #ifndef __GLIBC__
@@ -60,6 +61,7 @@ void print_help(const char *program) {
     puts("  -U, --uppernew=UPPERNEW    the upperdir of new OverlayFS (optional)");
     puts("  -i  --ignore-mounted       don't prompt if OverlayFS is still mounted (optional)");
     puts("  -f  --force-execution      also execute (and clean) the generated script in case of merge or vacuum (optional)");
+    puts("  -n  --non-shell            with merge action -f only: do fs operation directly instead of run shell script for better performance (optional)");
     puts("  -v, --verbose              with diff action only: when a directory only exists in one version, still list every file of the directory");
     puts("  -V, --version              print project version");
     puts("  -b, --brief                with diff action only: conform to output of diff --brief --recursive --no-dereference");
@@ -164,6 +166,7 @@ int main(int argc, char *argv[]) {
         { "verbose",        no_argument      , 0, 'v' },
         { "version",        no_argument      , 0, 'V' },
         { "brief",          no_argument      , 0, 'b' },
+        { "non-shell",      no_argument      , 0, 'n' },
         { 0,                0,                 0,  0  }
     };
 
@@ -171,7 +174,7 @@ int main(int argc, char *argv[]) {
     int long_index = 0;
     program_name = basename(argv[0]);
 
-    while ((opt = getopt_long_only(argc, argv, "l:u:m:L:U:ihvVb", long_options, &long_index)) != -1) {
+    while ((opt = getopt_long_only(argc, argv, "l:u:m:L:U:ihvVbn", long_options, &long_index)) != -1) {
         switch (opt) {
             case 'l':
                 lower = realpath(optarg, NULL);
@@ -212,6 +215,9 @@ int main(int argc, char *argv[]) {
                 verbose = false;
                 brief = true;
                 break;
+            case 'n':
+                non_shell = true;
+                break;
             case 'V':
                 version();
                 exit(EXIT_SUCCESS);
@@ -237,6 +243,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Upper directory cannot be opened.\n");
         goto see_help;
     }
+    if (non_shell && !force) {
+        fprintf(stderr, "--non-shell must be used with --force.\n");
+        return EXIT_FAILURE;
+    }
     if (!check_xattr_trusted(upper)) {
         fprintf(stderr, "The program cannot write trusted.* xattr. Try run again as root.\n");
         return EXIT_FAILURE;
@@ -257,9 +267,13 @@ int main(int argc, char *argv[]) {
             if (script == NULL) { fprintf(stderr, "Script file cannot be created.\n"); return EXIT_FAILURE; }
             out = vacuum(lower, upper, script);
         } else if (strcmp(argv[optind], "merge") == 0) {
-            script = create_shell_script(filename_template);
-            if (script == NULL) { fprintf(stderr, "Script file cannot be created.\n"); return EXIT_FAILURE; }
-            out = merge(lower, upper, script);
+            if (non_shell) {
+                out = mergeDirect(lower, upper);
+            } else {
+                script = create_shell_script(filename_template);
+                if (script == NULL) { fprintf(stderr, "Script file cannot be created.\n"); return EXIT_FAILURE; }
+                out = merge(lower, upper, script);
+            }
         } else if (strcmp(argv[optind], "deref") == 0) {
             if (!mnt || !vars[UPPERNEW]) { fprintf(stderr, "'deref' command requires --uppernew and --mountdir.\n"); return EXIT_FAILURE; }
             if (!directory_exists(mnt)) {

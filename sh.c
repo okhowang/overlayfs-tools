@@ -5,6 +5,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include "sh.h"
 
 char * vars[NUM_VARS];
@@ -95,4 +97,23 @@ int command(FILE *output, const char *command_format, ...) {
     va_end(arg);
     if (fputc('\n', output) == EOF) { return -1; }
     return 0;
+}
+
+int run_command(char *const argv[]) {
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork failed");
+        return -1;
+    }
+
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        exit(EXIT_FAILURE);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    return status;
 }

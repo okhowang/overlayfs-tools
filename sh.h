@@ -17,4 +17,6 @@ FILE* create_shell_script(char *tmp_path_buffer);
 
 int command(FILE *output, const char *command_format, ...);
 
+int run_command(char *const argv[]);
+
 #endif //OVERLAYFS_TOOLS_SH_H

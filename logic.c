@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/xattr.h>
 #include <fts.h>
+#include <ftw.h>
 #include <libgen.h>
 #include "logic.h"
 #include "sh.h"
@@ -189,6 +190,113 @@ int symbolic_link_identical(const char *lower_path, const char *upper_path, bool
     upper_buffer[upper_len] = '\0';
     *output = (strcmp(lower_buffer, upper_buffer) == 0);
     return 0;
+}
+
+static int rm(const char *path) {
+    int ret = remove(path);
+    if (ret) perror("Error removing file");
+    return ret;
+}
+
+static int rm_cb(const char *path, const struct stat *stat, int flag, struct FTW *ftw) {
+    rm(path);
+    return 0;
+}
+
+static int rm_r(const char *path) {
+    int ret = nftw(path, rm_cb, 64, FTW_DEPTH|FTW_PHYS);
+    if (ret) perror("Error removing file");
+    return ret;
+}
+
+static int rm_rf(const char *path) {
+    nftw(path, rm_cb, 64, FTW_DEPTH|FTW_PHYS);
+    return 0;
+}
+
+static int cp_attribute_only(const char *src, const char *dest) {
+    struct stat src_stat;
+    struct timespec new_times[2];
+
+    // Get source file attributes
+    if (stat(src, &src_stat) < 0) {
+        perror("Error getting source file attributes");
+        return -1;
+    }
+
+    // Set permissions on destination file
+    if (chmod(dest, src_stat.st_mode) < 0) {
+        perror("Error setting file permissions");
+        return -1;
+    }
+
+    // Set ownership on destination file
+    if (chown(dest, src_stat.st_uid, src_stat.st_gid) < 0) {
+        perror("Error setting file ownership");
+        return -1;
+    }
+
+    // Set timestamps on destination file
+    new_times[0] = src_stat.st_atim; // Access time
+    new_times[1] = src_stat.st_mtim; // Modification time
+    if (utimensat(AT_FDCWD, dest, new_times, 0) < 0) {
+        perror("Error setting file timestamps");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int cp(const char *src, const char *dest) {
+    int src_fd, dest_fd;
+    char buffer[4096];
+    ssize_t bytes_read, bytes_written;
+
+    // Open source file for reading
+    src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) {
+        perror("Error opening source file");
+        return -1;
+    }
+
+    // Open destination file for writing (create if it doesn't exist)
+    dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dest_fd < 0) {
+        perror("Error opening destination file");
+        close(src_fd);
+        return -1;
+    }
+
+    // Copy data from source to destination
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        bytes_written = write(dest_fd, buffer, bytes_read);
+        if (bytes_written != bytes_read) {
+            perror("Error writing to destination file");
+            close(src_fd);
+            close(dest_fd);
+            return -1;
+        }
+    }
+
+    if (bytes_read < 0) {
+        perror("Error reading source file");
+    }
+
+    // Close file descriptors
+    close(src_fd);
+    close(dest_fd);
+
+    return cp_attribute_only(src, dest);
+}
+
+static int mv(const char *from, const char *to) {
+    int ret = rename(from, to);
+    if (ret != EXDEV) {
+        if (ret != 0) perror("Error renaming file");
+        return ret;
+    }
+    char *const argv[] = {"mv", "-T", from, to, NULL}; // fallback to command
+    return run_command(argv);
 }
 
 static int vacuum_d(const char *lower_path, const char* upper_path, const size_t lower_root_len, const struct stat *lower_status, const struct stat *upper_status, FILE* script_stream, int *fts_instr) {
@@ -438,32 +546,51 @@ static int merge_d(const char *lower_path, const char* upper_path, const size_t 
             bool opaque = false;
             if (is_opaquedir(upper_path, &opaque) < 0) { return -1; }
             if (opaque) {
-                if (command(script_stream, "rm -r %L", lower_path) < 0) { return -1; };
+                if (script_stream)
+                    command(script_stream, "rm -r %L", lower_path);
+                else
+                    rm_r(lower_path);
             } else {
                 if (!permission_identical(lower_status, upper_status)) {
-                    command(script_stream, "chmod --reference %U %L", upper_path, lower_path);
+                    if (script_stream)
+                        command(script_stream, "chmod --reference %U %L", upper_path, lower_path);
+                    else
+                        cp_attribute_only(upper_path, lower_path);
                 }
                 return 0; // children must be recursed, and directory itself does not need to be printed
             }
         } else {
-            command(script_stream, "rm %L", lower_path);
+            if (script_stream)
+                command(script_stream, "rm %L", lower_path);
+            else
+                rm(lower_path);
         }
     }
     *fts_instr = FTS_SKIP;
-    return command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    if (script_stream)
+        return command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    return mv(upper_path, lower_path);
 }
 
 static int merge_dp(const char *lower_path, const char* upper_path, const size_t lower_root_len, const struct stat *lower_status, const struct stat *upper_status, FILE* script_stream, int *fts_instr) {
     if (lower_status != NULL) {
         if (file_type(lower_status) == S_IFDIR) {
             bool opaque = false;
-            if (is_opaquedir(upper_path, &opaque) < 0) { return -1; }
+            if (is_opaquedir(upper_path, &opaque) < 0) {
+                if (errno == ENOENT && script_stream == NULL) {
+                    // upper may be moved in merge_d
+                    return 0;
+                }
+                return -1;
+            }
             if (strlen(lower_path) == lower_root_len)
             {
               // Finish, don't delete upper_path_root
             }
             else if (!opaque) { // delete the directory: it should be empty already
-                return command(script_stream, "rmdir %U", upper_path);
+                if (script_stream != NULL)
+                    return command(script_stream, "rmdir %U", upper_path);
+                return rm(upper_path);
             }
         }
     }
@@ -474,23 +601,31 @@ static int merge_f(const char *lower_path, const char* upper_path, const size_t 
     bool metacopy, redirect;
     if (is_metacopy(upper_path, &metacopy) < 0) { return -1; }
     if (is_redirect(upper_path, &redirect) < 0) { return -1; }
-    // merging red is not supported, we must abort merge so lower data won't be deleted
+    // merging redirect is not supported, we must abort merge so lower data won't be deleted
     if (redirect) {
         fprintf(stderr, "Found redirect on %s. Merging redirect is not supported - Abort.\n", upper_path);
         return -1;
     }
     if (metacopy) {
-        return command(script_stream, "cp --attributes-only --preserve=all %U %L", upper_path, lower_path) || command(script_stream, "rm %U", upper_path);
+        if (script_stream != NULL)
+            return command(script_stream, "cp -p --attributes-only %U %L", upper_path, lower_path) || command(script_stream, "rm %U", upper_path);
+        return cp_attribute_only(upper_path, lower_path) || rm(upper_path);
     }
-    return command(script_stream, "rm -rf %L", lower_path) || command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    if (script_stream != NULL)
+        return command(script_stream, "rm -rf %L", lower_path) || command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    return rm_rf(lower_path) || mv(upper_path, lower_path);
 }
 
 static int merge_sl(const char *lower_path, const char* upper_path, const size_t lower_root_len, const struct stat *lower_status, const struct stat *upper_status, FILE* script_stream, int *fts_instr) {
-    return command(script_stream, "rm -rf %L", lower_path) || command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    if (script_stream != NULL)
+        return command(script_stream, "rm -rf %L", lower_path) || command(script_stream, "mv -T %U %L", upper_path, lower_path);
+    return rm_rf(lower_path) || mv(upper_path, lower_path);
 }
 
 static int merge_whiteout(const char *lower_path, const char* upper_path, const size_t lower_root_len, const struct stat *lower_status, const struct stat *upper_status, FILE* script_stream, int *fts_instr) {
-    return command(script_stream, "rm -r %L", lower_path) || command(script_stream, "rm %U", upper_path);
+    if (script_stream != NULL)
+        return command(script_stream, "rm -r %L", lower_path) || command(script_stream, "rm %U", upper_path);
+    return rm_r(lower_path) || rm(upper_path); // execute direct
 }
 
 typedef int (*TRAVERSE_CALLBACK)(const char *lower_path, const char* upper_path, const size_t lower_root_len, const struct stat *lower_status, const struct stat *upper_status, FILE* script_stream, int *fts_instr);
@@ -581,6 +716,10 @@ int diff(const char* lowerdir, const char* upperdir) {
 
 int merge(const char* lowerdir, const char* upperdir, FILE* script_stream) {
     return traverse(lowerdir, upperdir, script_stream, merge_d, merge_dp, merge_f, merge_sl, merge_whiteout);
+}
+
+int mergeDirect(const char* lowerdir, const char* upperdir) {
+    return traverse(lowerdir, upperdir, NULL, merge_d, merge_dp, merge_f, merge_sl, merge_whiteout);
 }
 
 int deref(const char* mountdir, const char* upperdir, FILE* script_stream) {
